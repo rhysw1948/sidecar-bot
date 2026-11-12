@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import sys
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -51,7 +52,7 @@ logger = logging.getLogger(__name__)
 # To add web research later, change RESEARCHER below (for example to
 # "asknews/news-summaries", which also needs ASKNEWS_* secrets).
 # =============================================================================
-MODEL_NAME = "openrouter/openai/gpt-oss-20b"
+MODEL_NAME = "openrouter/openai/gpt-oss-120b"
 
 
 def build_llms() -> dict:
@@ -205,6 +206,8 @@ class FallTemplateBot2026(ForecastBot):
             {question.resolution_criteria}
 
             {question.fine_print}
+
+            {FallTemplateBot2026._get_timing_message(question)}
             """
         )
         return prompt
@@ -235,6 +238,7 @@ class FallTemplateBot2026(ForecastBot):
             {research}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
+            {self._get_timing_message(question)}
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
@@ -305,6 +309,7 @@ class FallTemplateBot2026(ForecastBot):
             {research}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
+            {self._get_timing_message(question)}
 
             Before answering you write:
             (a) The time left until the outcome to the question is known.
@@ -383,9 +388,11 @@ class FallTemplateBot2026(ForecastBot):
             {research}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
+            {self._get_timing_message(question)}
 
             {lower_bound_message}
             {upper_bound_message}
+            {self._get_expected_range_message(question)}
 
             Formatting Instructions:
             - Please notice the units requested and give your answer in these units (e.g. whether you represent a number as 1,000,000 or 1 million).
@@ -417,6 +424,23 @@ class FallTemplateBot2026(ForecastBot):
         return await self._numeric_prompt_to_forecast(question, prompt)
 
     async def _numeric_prompt_to_forecast(
+        self,
+        question: NumericQuestion,
+        prompt: str,
+    ) -> ReasonedPrediction[NumericDistribution]:
+        # Sidecar-bot: if this one forecast fails the range check, retry it
+        # once (new LLM call) before letting it be dropped.
+        try:
+            return await self._numeric_prompt_to_forecast_once(question, prompt)
+        except Exception as e:
+            if not self._is_range_check_error(e):
+                raise
+            logger.warning(
+                f"Range check failed for {question.page_url}; retrying this forecast once. ({str(e)[:200]})"
+            )
+            return await self._numeric_prompt_to_forecast_once(question, prompt)
+
+    async def _numeric_prompt_to_forecast_once(
         self,
         question: NumericQuestion,
         prompt: str,
@@ -477,9 +501,11 @@ class FallTemplateBot2026(ForecastBot):
             {research}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
+            {self._get_timing_message(question)}
 
             {lower_bound_message}
             {upper_bound_message}
+            {self._get_expected_range_message(question)}
 
             Formatting Instructions:
             - This is a date question, and as such, the answer must be expressed in terms of dates.
@@ -517,6 +543,22 @@ class FallTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
+        # Sidecar-bot: same single retry as numeric questions.
+        try:
+            return await self._date_prompt_to_forecast_once(question, prompt)
+        except Exception as e:
+            if not self._is_range_check_error(e):
+                raise
+            logger.warning(
+                f"Range check failed for {question.page_url}; retrying this forecast once. ({str(e)[:200]})"
+            )
+            return await self._date_prompt_to_forecast_once(question, prompt)
+
+    async def _date_prompt_to_forecast_once(
+        self,
+        question: DateQuestion,
+        prompt: str,
+    ) -> ReasonedPrediction[NumericDistribution]:
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
@@ -550,6 +592,68 @@ class FallTemplateBot2026(ForecastBot):
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+    ##################################### SIDECAR-BOT PROMPT HELPERS #####################################
+
+    @staticmethod
+    def _format_time(value: datetime | None) -> str:
+        if value is None:
+            return "not stated"
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    @staticmethod
+    def _get_timing_message(question: MetaculusQuestion) -> str:
+        """Sidecar-bot: tell the model when the question opened and closes,
+        and that it is still open (Build 5 found models assuming it had closed)."""
+        opened = FallTemplateBot2026._format_time(question.open_time)
+        closes = FallTemplateBot2026._format_time(question.close_time)
+        return (
+            f"This question opened on {opened} and is scheduled to close on {closes}. "
+            "This question is still open; it has not resolved yet."
+        )
+
+    @staticmethod
+    def _format_number(value: float) -> str:
+        # Plain digits, never scientific notation (e.g. 4,000,000 or 0.1).
+        if float(value).is_integer():
+            return f"{int(value):,}"
+        return f"{value:,.6f}".rstrip("0").rstrip(".")
+
+    def _get_expected_range_message(
+        self, question: NumericQuestion | DateQuestion
+    ) -> str:
+        """Sidecar-bot: state the expected answer range and units from the
+        question's bounds, so the model answers on the right scale."""
+        if isinstance(question, DateQuestion):
+            low = question.lower_bound.date().isoformat()
+            high = question.upper_bound.date().isoformat()
+            return (
+                f"Answers are expected between {low} and {high}. "
+                "Give your dates in this range, as YYYY-MM-DD."
+            )
+        low_num = (
+            question.nominal_lower_bound
+            if question.nominal_lower_bound is not None
+            else question.lower_bound
+        )
+        high_num = (
+            question.nominal_upper_bound
+            if question.nominal_upper_bound is not None
+            else question.upper_bound
+        )
+        unit = f" {question.unit_of_measure}" if question.unit_of_measure else ""
+        return (
+            f"Answers are expected between {self._format_number(low_num)} and "
+            f"{self._format_number(high_num)}{unit}. Give your numbers on this scale."
+        )
+
+    @staticmethod
+    def _is_range_check_error(error: Exception) -> bool:
+        """True if the error is forecasting_tools' 'too far from bounds' check."""
+        return isinstance(error, ValueError) and (
+            "No declared percentiles are within the range of the question"
+            in str(error)
+        )
 
     def _create_resolved_question_parsing_message(self) -> str:
         return "- If the text concludes that the question has already resolved *in the past* (i.e. it treats the question as decided rather than something to forecast), please DO NOT return a parsed output, even if a final forecast is also given. Instead indicate that the answer is not explicitly given in the text.\n"
@@ -704,6 +808,28 @@ class FallTemplateBot2026(ForecastBot):
         )
 
 
+def run_outcome_exit_code(forecast_reports: list) -> int:
+    """Sidecar-bot: the run fails (exit code 1) only if MORE than half of the
+    questions errored. A few skipped questions do not fail the whole run."""
+    total = len(forecast_reports)
+    failed = sum(1 for r in forecast_reports if isinstance(r, BaseException))
+    if total == 0:
+        print("Run outcome: no questions to forecast. Exit code 0.")
+        return 0
+    if failed * 2 > total:
+        print(
+            f"RUN FAILED: {failed} of {total} questions errored (more than half). Exit code 1."
+        )
+        return 1
+    if failed:
+        print(
+            f"Run outcome: {failed} of {total} questions errored (not more than half). Exit code 0."
+        )
+    else:
+        print(f"Run outcome: all {total} questions succeeded. Exit code 0.")
+    return 0
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -795,9 +921,11 @@ if __name__ == "__main__":
             )
         )
 
-    template_bot.log_report_summary(forecast_reports)
+    # Sidecar-bot: raise_errors=False so the summary always prints.
+    template_bot.log_report_summary(forecast_reports, raise_errors=False)
     print_run_summary_banner(
         forecast_reports,
         will_publish=publish_to_metaculus,
         tournament_url=TOURNAMENT_URLS.get(run_mode),
     )
+    sys.exit(run_outcome_exit_code(forecast_reports))
