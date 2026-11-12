@@ -1,0 +1,52 @@
+name: Forecast on MiniBench
+
+# Sidecar-bot: this is the ONLY workflow with a schedule.
+# It forecasts on MiniBench only (not the Fall tournament, not the Metaculus Cup).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7,27,47 * * * *" # every 20 min, offset off the hour (same as the template). Already-forecasted questions are skipped.
+
+# Prevent parallel runs
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  forecast_job:
+    runs-on: ubuntu-latest
+    env:
+      # Only these two secrets are needed. Create them under
+      # Settings --> Secrets and variables --> Actions --> New repository secret.
+      METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - name: Check secrets are set (fail early)
+        run: |
+          missing=0
+          if [ -z "$METACULUS_TOKEN" ]; then
+            echo "::error::Secret METACULUS_TOKEN is missing. Add it under Settings > Secrets and variables > Actions."
+            missing=1
+          fi
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::error::Secret OPENROUTER_API_KEY is missing. Add it under Settings > Secrets and variables > Actions."
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Both secrets are set."
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.13.1"
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run bot (MiniBench only)
+        run: |
+          uv run python main.py --mode minibench
