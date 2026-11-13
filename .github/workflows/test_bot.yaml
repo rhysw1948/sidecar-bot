@@ -40,3 +40,29 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+      # Sidecar-bot: keep a private record of every raw forecast.
+      # The plain log is encrypted with the public key in this repo, then
+      # deleted. Only the encrypted .gpg file is uploaded (artifacts on a
+      # public repo can be downloaded by any signed-in GitHub user).
+      - name: Encrypt forecast log
+        if: always()
+        run: |
+          gpg --version | head -n 1
+          if [ -f forecast_log.jsonl ]; then
+            echo "forecast_log.jsonl lines: $(wc -l < forecast_log.jsonl)"
+            gpg --batch --yes --trust-model always \
+              --recipient-file forecast_log_pubkey.asc \
+              --output forecast_log.jsonl.gpg --encrypt forecast_log.jsonl
+            rm -f forecast_log.jsonl
+          else
+            echo "No forecast_log.jsonl this run (no questions forecast)."
+          fi
+          ls -la forecast_log* 2>/dev/null || true
+      - name: Upload encrypted forecast log (.gpg only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forecast-log-${{ github.run_id }}
+          path: forecast_log.jsonl.gpg
+          retention-days: 90
+          if-no-files-found: ignore

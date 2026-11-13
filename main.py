@@ -1,6 +1,8 @@
 import argparse
 import asyncio
+import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from typing import Literal
@@ -32,6 +34,7 @@ from forecasting_tools import (
     Percentile,
     ConditionalQuestion,
     ConditionalPrediction,
+    MonetaryCostManager,
     PredictionTypes,
     PredictionAffirmed,
     BinaryPrediction,
@@ -64,6 +67,60 @@ def build_llms() -> dict:
         "researcher": RESEARCHER,
         "parser": llm,
     }
+# =============================================================================
+
+# =============================================================================
+# FORECAST LOG (Sidecar-bot). One JSON line per question per run, written to
+# forecast_log.jsonl. It keeps the raw individual forecasts BEFORE any future
+# adjustment, so resolved questions can be replayed later. No reasoning text.
+# The GitHub workflows encrypt this file and upload only the encrypted copy.
+# Logging must never break a run: every step is wrapped in try/except.
+# =============================================================================
+PROMPT_VERSION = "v1-build6"
+FORECAST_LOG_PATH = os.environ.get("FORECAST_LOG_PATH", "forecast_log.jsonl")
+RUN_STARTED_UTC = datetime.now(timezone.utc).isoformat(timespec="seconds")
+RUN_MODE = "unknown"  # set in __main__
+
+
+def _iso(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        return str(value)
+
+
+def _prediction_to_json(pred):
+    """Plain JSON form of one prediction: a probability (binary), option
+    probabilities (multiple choice), or declared percentiles (numeric,
+    discrete, date; date values are Unix timestamps)."""
+    if isinstance(pred, (int, float)):
+        return float(pred)
+    if isinstance(pred, PredictedOptionList):
+        return {o.option_name: o.probability for o in pred.predicted_options}
+    if isinstance(pred, NumericDistribution):
+        return [[p.percentile, p.value] for p in pred.declared_percentiles]
+    if hasattr(pred, "model_dump"):
+        return pred.model_dump(mode="json")
+    return str(pred)
+
+
+def _final_to_json(pred):
+    """The aggregated forecast in the form that is sent. For numeric/date
+    questions this is the CDF (x values and cumulative probabilities)."""
+    if isinstance(pred, NumericDistribution):
+        cdf = pred.get_cdf()
+        return {
+            "cdf_x": [p.value for p in cdf],
+            "cdf": [p.percentile for p in cdf],
+        }
+    return _prediction_to_json(pred)
+
+
+def _write_forecast_log_line(record: dict) -> None:
+    with open(FORECAST_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=str) + "\n")
 # =============================================================================
 
 
@@ -147,6 +204,86 @@ class FallTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+
+    ##################################### SIDECAR-BOT FORECAST LOG #####################################
+
+    def _fl_state(self, question: MetaculusQuestion) -> dict:
+        """Per-question scratch data for the forecast log (keyed by object id,
+        because several questions can run at the same time)."""
+        if not hasattr(self, "_fl_states"):
+            self._fl_states = {}
+        return self._fl_states.setdefault(
+            id(question),
+            {"individual": [], "prediction_errors": [], "range_check_retries": 0},
+        )
+
+    async def _research_and_make_predictions(self, question: MetaculusQuestion):
+        result = await super()._research_and_make_predictions(question)
+        try:
+            state = self._fl_state(question)
+            state["individual"].extend(
+                _prediction_to_json(p.prediction_value) for p in result.predictions
+            )
+            state["prediction_errors"].extend(str(e)[:500] for e in result.errors)
+        except Exception as e:
+            logger.warning(f"Forecast log: could not record predictions ({type(e).__name__}: {str(e)[:200]})")
+        return result
+
+    async def _run_individual_question(self, question: MetaculusQuestion):
+        report = None
+        error: BaseException | None = None
+        cost = None
+        try:
+            with MonetaryCostManager() as cost_manager:
+                try:
+                    report = await super()._run_individual_question(question)
+                finally:
+                    cost = cost_manager.current_usage
+            return report
+        except BaseException as e:
+            error = e
+            raise
+        finally:
+            self._fl_write_record(question, report, error, cost)
+
+    def _fl_write_record(self, question, report, error, cost) -> None:
+        try:
+            state = self._fl_states.pop(id(question), None) if hasattr(self, "_fl_states") else None
+            state = state or {"individual": [], "prediction_errors": [], "range_check_retries": 0}
+            errors = list(state["prediction_errors"])
+            if report is not None:
+                errors += [str(e)[:500] for e in (report.errors or []) if str(e)[:500] not in errors]
+            if error is not None:
+                errors.append(f"{type(error).__name__}: {str(error)[:500]}")
+            record = {
+                "logged_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "run_time_utc": RUN_STARTED_UTC,
+                "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+                "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+                "mode": RUN_MODE,
+                "model": MODEL_NAME,
+                "prompt_version": PROMPT_VERSION,
+                "post_id": question.id_of_post,
+                "question_id": question.id_of_question,
+                "question_type": type(question).__name__,
+                "group_option": question.group_question_option,
+                "title": question.question_text,
+                "page_url": question.page_url,
+                "open_time": _iso(question.open_time),
+                "scheduled_close_time": _iso(question.close_time),
+                "scheduled_resolution_time": _iso(getattr(question, "scheduled_resolution_time", None)),
+                "individual_predictions": state["individual"],
+                "n_individual": len(state["individual"]),
+                "final_forecast": _final_to_json(report.prediction) if report is not None else None,
+                "publish_enabled": bool(self.publish_reports_to_metaculus),
+                "succeeded": report is not None and error is None,
+                "range_check_retries": state["range_check_retries"],
+                "errors": errors,
+                "cost_usd_estimate": cost,
+            }
+            _write_forecast_log_line(record)
+        except Exception as e:
+            logger.warning(f"Forecast log: could not write a line ({type(e).__name__}: {str(e)[:200]}). Carrying on.")
 
     ##################################### RESEARCH #####################################
 
@@ -438,6 +575,7 @@ class FallTemplateBot2026(ForecastBot):
             logger.warning(
                 f"Range check failed for {question.page_url}; retrying this forecast once. ({str(e)[:200]})"
             )
+            self._fl_count_retry(question)
             return await self._numeric_prompt_to_forecast_once(question, prompt)
 
     async def _numeric_prompt_to_forecast_once(
@@ -552,6 +690,7 @@ class FallTemplateBot2026(ForecastBot):
             logger.warning(
                 f"Range check failed for {question.page_url}; retrying this forecast once. ({str(e)[:200]})"
             )
+            self._fl_count_retry(question)
             return await self._date_prompt_to_forecast_once(question, prompt)
 
     async def _date_prompt_to_forecast_once(
@@ -646,6 +785,12 @@ class FallTemplateBot2026(ForecastBot):
             f"Answers are expected between {self._format_number(low_num)} and "
             f"{self._format_number(high_num)}{unit}. Give your numbers on this scale."
         )
+
+    def _fl_count_retry(self, question: MetaculusQuestion) -> None:
+        try:
+            self._fl_state(question)["range_check_retries"] += 1
+        except Exception:
+            pass
 
     @staticmethod
     def _is_range_check_error(error: Exception) -> bool:
@@ -848,6 +993,7 @@ if __name__ == "__main__":
     run_mode: Literal[
         "tournament", "minibench", "metaculus_cup", "test_questions"
     ] = args.mode
+    RUN_MODE = run_mode  # recorded in forecast_log.jsonl
 
     check_environment(strict=True)
     publish_to_metaculus = True

@@ -177,3 +177,7 @@ cython_debug/
 
 # Local scratch/temp scripts
 temp/
+
+# Sidecar-bot forecast log: never commit the plain or encrypted log.
+forecast_log.jsonl
+forecast_log.jsonl.gpg
