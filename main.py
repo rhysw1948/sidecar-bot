@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -133,7 +134,8 @@ def _write_forecast_log_line(record: dict) -> None:
 # forecast_log.jsonl (arm "shadow-news"). Nothing is posted, no comment.
 # Any shadow failure logs a warning and carries on; it never changes the
 # normal forecast, the posting or the exit code.
-# Switch off with env SHADOW_NEWS=off. Needs env ASKNEWS_API_KEY.
+# Switch off with env SHADOW_NEWS=off (this also stops the sceptic arm,
+# which needs its news). Needs env ASKNEWS_API_KEY.
 # =============================================================================
 SHADOW_TAG = "shadow-news-v1"
 SHADOW_CREDIT_CAP_PER_RUN = 80  # counted from the API's usage.credits field
@@ -199,6 +201,62 @@ def _is_credit_exhausted_error(error: BaseException) -> bool:
         return True
     text = f"{getattr(error, 'detail', '')} {error}".lower()
     return any(w in text for w in ("credit", "balance", "insufficient", "payment", "quota", "wallet"))
+# =============================================================================
+
+# =============================================================================
+# SHADOW SCEPTIC ARM (Sidecar-bot, Build 11). LOG ONLY, NEVER POSTED.
+# Runs right after the shadow news arm for the same question and reuses the
+# SAME news text (no extra AskNews search, 0 extra credits). Same model and
+# 5 predictions; the only difference is a scepticism block added to the
+# forecast prompt, just before the final-answer instructions. The block text
+# lives in prompts/sceptic_v1.txt. If the text changes, bump SCEPTIC_TAG.
+# If the news arm has no news text, this arm is skipped and the reason logged.
+# Switch off with env SHADOW_SCEPTIC=off. The shadow POST guard covers it.
+# =============================================================================
+SCEPTIC_TAG = "shadow-sceptic-v1"
+SCEPTIC_PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts", "sceptic_v1.txt")
+_FINAL_ANSWER_MARKER = "The last thing you write is"
+# Set only inside the sceptic arm's own asyncio tasks (context variables are
+# copied per task), so the posted and news arms never see the block.
+_SCEPTIC_SECTION: contextvars.ContextVar = contextvars.ContextVar("sidecar_sceptic_section", default=None)
+
+
+def _load_sceptic_block(path: str | None = None) -> dict:
+    """Read the three parts of the block file: 'all', 'numeric', 'mc'."""
+    with open(path or SCEPTIC_PROMPT_FILE, encoding="utf-8") as f:
+        text = f.read()
+
+    def between(start: str, end: str) -> str:
+        i = text.index(start) + len(start)
+        j = text.index(end, i)
+        part = text[i:j].strip()
+        if not part:
+            raise ValueError(f"empty part after {start!r}")
+        return part
+
+    return {
+        "all": between("--- start block (all question types) ---", "--- end block ---"),
+        "numeric": between("--- extra lines for numeric, discrete and date questions only ---", "--- end ---"),
+        "mc": between("--- extra lines for multiple-choice questions only ---", "--- end ---"),
+    }
+
+
+def _sceptic_section_for(question, block: dict) -> str:
+    text = block["all"]
+    if isinstance(question, (NumericQuestion, DateQuestion)):  # DiscreteQuestion is a NumericQuestion
+        text += "\n" + block["numeric"]
+    elif isinstance(question, MultipleChoiceQuestion):
+        text += "\n" + block["mc"]
+    return text
+
+
+def _insert_sceptic_section(prompt: str, section: str) -> str:
+    """Put the block as its own section just before the LAST final-answer
+    instruction. Everything else in the prompt stays exactly as it was."""
+    i = prompt.rfind(_FINAL_ANSWER_MARKER)
+    if i < 0:
+        raise ValueError("sceptic arm: final-answer instruction not found in prompt")
+    return prompt[:i] + section.strip() + "\n\n" + prompt[i:]
 # =============================================================================
 
 
@@ -408,7 +466,7 @@ class FallTemplateBot2026(ForecastBot):
             logger.setLevel(old_level)
             _SHADOW_ACTIVE["depth"] -= 1
         logger.info(
-            f"Shadow news arm: done for {len(queue)} question(s). AskNews credits used this run: {_SHADOW_RUN['credits_used']}."
+            f"Shadow news + sceptic arms: done for {len(queue)} question(s). AskNews credits used this run: {_SHADOW_RUN['credits_used']}."
         )
 
     async def _shadow_one_question_safely(self, question, posted_ok: bool, deadline: float) -> None:
@@ -416,7 +474,7 @@ class FallTemplateBot2026(ForecastBot):
             "search_query": None, "article_count": None, "newest_article_utc": None,
             "oldest_article_utc": None, "asknews_credits": 0,
         }
-        result = {"individual": [], "final": None, "errors": [], "retries": 0, "cost": None}
+        result = {"individual": [], "final": None, "errors": [], "retries": 0, "cost": None, "news": None}
         skipped = None
         shadow_q = None
         try:
@@ -456,6 +514,66 @@ class FallTemplateBot2026(ForecastBot):
                 self._shadow_write_record(question, info, result, succeeded=(not skipped and result["final"] is not None))
             except Exception as e:
                 _shadow_warn_once("log", f"could not write a shadow log line ({type(e).__name__}: {str(e)[:200]}).")
+        # Build 11: the sceptic arm, same news text, after the news arm's line is written.
+        await self._sceptic_one_question_safely(question, info, result.get("news"), deadline)
+
+    async def _sceptic_one_question_safely(self, question, news_info: dict, news: str | None, deadline: float) -> None:
+        info = dict(news_info)  # same search query and article info as shadow-news
+        info["asknews_credits"] = 0  # no extra search
+        info["asknews_credits_reported"] = None
+        result = {"individual": [], "final": None, "errors": [], "retries": 0, "cost": None}
+        skipped = None
+        sq = None
+        try:
+            if os.environ.get("SHADOW_SCEPTIC", "on").strip().lower() in ("off", "0", "false", "no"):
+                skipped = "skipped: switched off (SHADOW_SCEPTIC=off)"
+            elif news is None:
+                skipped = "skipped: shadow-news has no news text for this question"
+            elif asyncio.get_running_loop().time() > deadline:
+                skipped = "skipped: shadow phase time budget used up"
+                _shadow_warn_once("sceptic-deadline", "shadow-sceptic: time budget used up; remaining sceptic forecasts skipped.")
+            else:
+                if not hasattr(self, "_sceptic_block"):
+                    self._sceptic_block = _load_sceptic_block()
+                section = _sceptic_section_for(question, self._sceptic_block)
+                sq = question.model_copy(deep=True)  # own copy: own retry count, never touches posted state
+
+                async def run():
+                    _SCEPTIC_SECTION.set(section)  # only this task and the tasks it starts
+                    await self._shadow_predict(sq, news, result)
+
+                with MonetaryCostManager() as cm:
+                    try:
+                        await asyncio.wait_for(run(), timeout=SHADOW_PER_QUESTION_TIMEOUT_S)
+                    finally:
+                        result["cost"] = cm.current_usage
+        except Exception as e:
+            result["errors"].append(f"{type(e).__name__}: {str(e)[:500]}")
+            _shadow_warn_once(
+                f"sceptic-err-{id(question)}",
+                f"shadow-sceptic failed for {question.page_url} ({type(e).__name__}: {str(e)[:200]}). Carrying on.",
+            )
+        finally:
+            try:
+                if sq is not None and hasattr(self, "_fl_states"):
+                    st = self._fl_states.pop(id(sq), None)
+                    if st:
+                        result["retries"] = st.get("range_check_retries", 0)
+                if skipped:
+                    result["errors"].append(skipped)
+                self._shadow_write_record(
+                    question, info, result, succeeded=(not skipped and result["final"] is not None),
+                    arm="shadow-sceptic", tag=SCEPTIC_TAG,
+                )
+            except Exception as e:
+                _shadow_warn_once("sceptic-log", f"shadow-sceptic: could not write a log line ({type(e).__name__}: {str(e)[:200]}).")
+
+    def _apply_sceptic_section(self, question, prompt: str) -> str:
+        """No-op for the posted and news arms (prompt returned unchanged)."""
+        section = _SCEPTIC_SECTION.get()
+        if not section:
+            return prompt
+        return _insert_sceptic_section(prompt, section)
 
     async def _shadow_forecast(self, question, info: dict, result: dict) -> None:
         query = await self._shadow_write_query(question)
@@ -463,6 +581,10 @@ class FallTemplateBot2026(ForecastBot):
         news = await self._shadow_search_news(query, info)
         if news is None:
             raise RuntimeError("no news (search skipped or failed)")
+        result["news"] = news  # kept in memory for the sceptic arm; never logged
+        await self._shadow_predict(question, news, result)
+
+    async def _shadow_predict(self, question, news: str, result: dict) -> None:
         forecast_fn = self._shadow_forecast_function(question)
         outcomes = await asyncio.gather(
             *(forecast_fn(question, news) for _ in range(self.predictions_per_research_report)),
@@ -566,10 +688,12 @@ class FallTemplateBot2026(ForecastBot):
             )
         return text
 
-    def _shadow_write_record(self, question, info: dict, result: dict, succeeded: bool) -> None:
+    def _shadow_write_record(
+        self, question, info: dict, result: dict, succeeded: bool, arm: str = "shadow-news", tag: str = SHADOW_TAG
+    ) -> None:
         record = {
-            "arm": "shadow-news",
-            "shadow_tag": SHADOW_TAG,
+            "arm": arm,
+            "shadow_tag": tag,
             "logged_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "run_time_utc": RUN_STARTED_UTC,
             "github_run_id": os.environ.get("GITHUB_RUN_ID"),
@@ -716,6 +840,7 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
+        prompt = self._apply_sceptic_section(question, prompt)  # Build 11: no-op outside the sceptic arm
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
@@ -789,6 +914,7 @@ class FallTemplateBot2026(ForecastBot):
         question: MultipleChoiceQuestion,
         prompt: str,
     ) -> ReasonedPrediction[PredictedOptionList]:
+        prompt = self._apply_sceptic_section(question, prompt)  # Build 11: no-op outside the sceptic arm
         parsing_instructions = clean_indents(
             f"""
             Make sure that all option names are one of the following:
@@ -886,6 +1012,7 @@ class FallTemplateBot2026(ForecastBot):
     ) -> ReasonedPrediction[NumericDistribution]:
         # Sidecar-bot: if this one forecast fails the range check, retry it
         # once (new LLM call) before letting it be dropped.
+        prompt = self._apply_sceptic_section(question, prompt)  # Build 11: no-op outside the sceptic arm
         try:
             return await self._numeric_prompt_to_forecast_once(question, prompt)
         except Exception as e:
@@ -1001,6 +1128,7 @@ class FallTemplateBot2026(ForecastBot):
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
         # Sidecar-bot: same single retry as numeric questions.
+        prompt = self._apply_sceptic_section(question, prompt)  # Build 11: no-op outside the sceptic arm
         try:
             return await self._date_prompt_to_forecast_once(question, prompt)
         except Exception as e:

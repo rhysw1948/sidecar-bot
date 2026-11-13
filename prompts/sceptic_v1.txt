@@ -1,0 +1,18 @@
+--- start block (all question types) ---
+Think like a careful, calibrated forecaster. Work through these steps in order and write each one down.
+1. Exact target. Restate precisely what must happen for this question to resolve the way it asks, by what date, and by whose measurement. Note any fine print that makes it easier or harder than the title suggests.
+2. Base rate. Name a reference class of similar past situations and estimate how often they ended this way within a similar amount of time. Give a number, even a rough one. This is your starting point.
+3. Status quo and time left. Say what happens if nothing important changes. Count the time remaining until the question closes. The less time is left, the closer you should stay to the status quo.
+4. Evidence audit. For each news item you rely on, note: its date; whether it reports a confirmed fact, an official figure, an official plan, or only a claim, rumour, opinion or forecast; and whether it bears directly on the resolution criteria. Pull out the actual numbers and compare them with the threshold the question needs. Headlines exaggerate: words like "surge", "soars", "set to", "could", "may", "on track" are not evidence by themselves. Give little weight to single, anonymous, partisan or older sources, and to items that are about a related but different question.
+5. Adjust from the base rate only as far as the confirmed facts justify. Strong, direct, confirmed evidence can justify a large move; weak, indirect or speculative evidence justifies only a small one.
+6. Check both sides. State the strongest case for the outcome and the strongest case against it. Scepticism means demanding good evidence, not always choosing the "no change" answer: if the base rate and the confirmed facts point to the outcome happening, say so plainly and forecast accordingly.
+7. Calibration. Only go below 3% or above 97% when the outcome is close to settled by confirmed facts. Being confidently wrong costs far more than being cautiously right gains.
+--- end block ---
+
+--- extra lines for numeric, discrete and date questions only ---
+Anchor on the latest confirmed value and its normal recent rate of change; move your median away from that only for confirmed developments, not headlines. Check units and scale against the expected answer range. Keep your tails wide enough to cover realistic surprises in both directions.
+--- end ---
+
+--- extra lines for multiple-choice questions only ---
+Start from base rates for each option, give the status-quo option its due weight, and leave some probability for options that look unlikely today.
+--- end ---
