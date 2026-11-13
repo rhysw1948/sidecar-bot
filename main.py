@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -121,6 +122,83 @@ def _final_to_json(pred):
 def _write_forecast_log_line(record: dict) -> None:
     with open(FORECAST_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, default=str) + "\n")
+# =============================================================================
+
+# =============================================================================
+# SHADOW NEWS ARM (Sidecar-bot, Build 10). LOG ONLY, NEVER POSTED.
+# After ALL normal forecasts of a run have been posted, each question gets a
+# second "with-news" forecast: one LLM call writes a news search query, one
+# AskNews "latest news" search (1 credit), then the same model and prompts
+# (5 predictions) with the news text as research. The result goes ONLY into
+# forecast_log.jsonl (arm "shadow-news"). Nothing is posted, no comment.
+# Any shadow failure logs a warning and carries on; it never changes the
+# normal forecast, the posting or the exit code.
+# Switch off with env SHADOW_NEWS=off. Needs env ASKNEWS_API_KEY.
+# =============================================================================
+SHADOW_TAG = "shadow-news-v1"
+SHADOW_CREDIT_CAP_PER_RUN = 80  # counted from the API's usage.credits field
+SHADOW_ASKNEWS_GAP_SECONDS = 2.5  # free plan: 1 request per 2 s
+SHADOW_ARTICLES = 6  # "latest news" search, same size as AskNews test 1
+SHADOW_PARALLEL_QUESTIONS = 2
+SHADOW_PER_QUESTION_TIMEOUT_S = 300
+SHADOW_PHASE_BUDGET_S = 1800  # no new shadow starts after this many seconds
+
+_SHADOW_RUN = {
+    "credits_used": 0,
+    "disabled_reason": None,  # set once (no key, credits exhausted...) -> skip rest of run
+    "warned": set(),
+    "last_asknews_call": 0.0,
+}
+_SHADOW_ACTIVE = {"depth": 0}  # > 0 while shadow code runs: Metaculus writes are refused
+
+
+class ShadowPostBlocked(RuntimeError):
+    pass
+
+
+def _install_shadow_post_guard() -> None:
+    """Wrap requests.Session.request (which requests.get/post also use, and
+    which MetaculusClient uses for every call). While the shadow runs, any
+    non-GET request to metaculus.com raises ShadowPostBlocked BEFORE sending."""
+    import requests
+
+    if getattr(requests.sessions.Session.request, "_sidecar_shadow_guard", False):
+        return
+    original = requests.sessions.Session.request
+
+    def guarded(self, method, url, *args, **kwargs):
+        if (
+            _SHADOW_ACTIVE["depth"] > 0
+            and "metaculus.com" in str(url).lower()
+            and str(method).upper() not in ("GET", "HEAD", "OPTIONS")
+        ):
+            raise ShadowPostBlocked(
+                f"SHADOW GUARD: refused {str(method).upper()} to Metaculus inside the shadow arm"
+            )
+        return original(self, method, url, *args, **kwargs)
+
+    guarded._sidecar_shadow_guard = True
+    requests.sessions.Session.request = guarded
+
+
+_install_shadow_post_guard()
+
+
+def _shadow_warn_once(key: str, message: str) -> None:
+    if key in _SHADOW_RUN["warned"]:
+        return
+    _SHADOW_RUN["warned"].add(key)
+    logger.warning(f"Shadow news arm: {message}")
+
+
+def _is_credit_exhausted_error(error: BaseException) -> bool:
+    """[INFERRED, not tested at 0 credits] AskNews out-of-credit / bad-key
+    answers: HTTP 401/402/403, or a message about credits/balance/payment."""
+    code = getattr(error, "code", None)
+    if isinstance(code, int) and code // 1000 in (401, 402, 403):
+        return True
+    text = f"{getattr(error, 'detail', '')} {error}".lower()
+    return any(w in text for w in ("credit", "balance", "insufficient", "payment", "quota", "wallet"))
 # =============================================================================
 
 
@@ -245,6 +323,12 @@ class FallTemplateBot2026(ForecastBot):
             raise
         finally:
             self._fl_write_record(question, report, error, cost)
+            try:  # remember the question for the shadow arm (runs after ALL posting)
+                if not hasattr(self, "_shadow_queue"):
+                    self._shadow_queue = []
+                self._shadow_queue.append((question, report is not None and error is None))
+            except Exception:
+                pass
 
     def _fl_write_record(self, question, report, error, cost) -> None:
         try:
@@ -256,6 +340,7 @@ class FallTemplateBot2026(ForecastBot):
             if error is not None:
                 errors.append(f"{type(error).__name__}: {str(error)[:500]}")
             record = {
+                "arm": "posted",
                 "logged_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "run_time_utc": RUN_STARTED_UTC,
                 "github_run_id": os.environ.get("GITHUB_RUN_ID"),
@@ -284,6 +369,240 @@ class FallTemplateBot2026(ForecastBot):
             _write_forecast_log_line(record)
         except Exception as e:
             logger.warning(f"Forecast log: could not write a line ({type(e).__name__}: {str(e)[:200]}). Carrying on.")
+
+    ##################################### SIDECAR-BOT SHADOW NEWS ARM #####################################
+
+    async def forecast_questions(self, questions, return_exceptions: bool = False):
+        # Normal forecasting AND posting for every question happens first,
+        # inside super(). The shadow arm only starts after that has returned.
+        self._shadow_queue = []
+        reports = await super().forecast_questions(questions, return_exceptions)
+        queue, self._shadow_queue = self._shadow_queue, []
+        try:
+            await self._run_shadow_phase(queue)
+        except Exception as e:  # never let the shadow change the run
+            _shadow_warn_once("phase", f"shadow phase failed ({type(e).__name__}: {str(e)[:200]}). Carrying on.")
+        return reports
+
+    async def _run_shadow_phase(self, queue: list) -> None:
+        if not queue:
+            return
+        if os.environ.get("SHADOW_NEWS", "on").strip().lower() in ("off", "0", "false", "no"):
+            _SHADOW_RUN["disabled_reason"] = _SHADOW_RUN["disabled_reason"] or "switched off (SHADOW_NEWS=off)"
+        elif not os.environ.get("ASKNEWS_API_KEY"):
+            _SHADOW_RUN["disabled_reason"] = _SHADOW_RUN["disabled_reason"] or "no ASKNEWS_API_KEY"
+        # Created here (not at class level) so they belong to this event loop.
+        self._shadow_asknews_lock = asyncio.Lock()
+        semaphore = asyncio.Semaphore(SHADOW_PARALLEL_QUESTIONS)
+        deadline = asyncio.get_running_loop().time() + SHADOW_PHASE_BUDGET_S
+        _SHADOW_ACTIVE["depth"] += 1
+        old_level = logger.level
+        logger.setLevel(logging.WARNING)  # keep shadow reasoning out of the public Actions log
+        try:
+            async def one(question, posted_ok):
+                async with semaphore:
+                    await self._shadow_one_question_safely(question, posted_ok, deadline)
+
+            await asyncio.gather(*(one(q, ok) for q, ok in queue), return_exceptions=True)
+        finally:
+            logger.setLevel(old_level)
+            _SHADOW_ACTIVE["depth"] -= 1
+        logger.info(
+            f"Shadow news arm: done for {len(queue)} question(s). AskNews credits used this run: {_SHADOW_RUN['credits_used']}."
+        )
+
+    async def _shadow_one_question_safely(self, question, posted_ok: bool, deadline: float) -> None:
+        info = {
+            "search_query": None, "article_count": None, "newest_article_utc": None,
+            "oldest_article_utc": None, "asknews_credits": 0,
+        }
+        result = {"individual": [], "final": None, "errors": [], "retries": 0, "cost": None}
+        skipped = None
+        shadow_q = None
+        try:
+            if not posted_ok:
+                skipped = "skipped: the posted arm failed for this question"
+            elif _SHADOW_RUN["disabled_reason"]:
+                skipped = f"skipped: {_SHADOW_RUN['disabled_reason']}"
+                _shadow_warn_once("disabled", f"{_SHADOW_RUN['disabled_reason']}; shadow skipped for the rest of this run.")
+            elif asyncio.get_running_loop().time() > deadline:
+                skipped = "skipped: shadow phase time budget used up"
+                _shadow_warn_once("deadline", "time budget used up; remaining shadows skipped.")
+            else:
+                # A copy, so retry counts etc. never touch the posted question's state.
+                shadow_q = question.model_copy(deep=True)
+                with MonetaryCostManager() as cm:
+                    try:
+                        await asyncio.wait_for(
+                            self._shadow_forecast(shadow_q, info, result),
+                            timeout=SHADOW_PER_QUESTION_TIMEOUT_S,
+                        )
+                    finally:
+                        result["cost"] = cm.current_usage
+        except Exception as e:
+            result["errors"].append(f"{type(e).__name__}: {str(e)[:500]}")
+            _shadow_warn_once(
+                f"err-{id(question)}",
+                f"failed for {question.page_url} ({type(e).__name__}: {str(e)[:200]}). Carrying on.",
+            )
+        finally:
+            try:
+                if shadow_q is not None and hasattr(self, "_fl_states"):
+                    st = self._fl_states.pop(id(shadow_q), None)
+                    if st:
+                        result["retries"] = st.get("range_check_retries", 0)
+                if skipped:
+                    result["errors"].append(skipped)
+                self._shadow_write_record(question, info, result, succeeded=(not skipped and result["final"] is not None))
+            except Exception as e:
+                _shadow_warn_once("log", f"could not write a shadow log line ({type(e).__name__}: {str(e)[:200]}).")
+
+    async def _shadow_forecast(self, question, info: dict, result: dict) -> None:
+        query = await self._shadow_write_query(question)
+        info["search_query"] = query
+        news = await self._shadow_search_news(query, info)
+        if news is None:
+            raise RuntimeError("no news (search skipped or failed)")
+        forecast_fn = self._shadow_forecast_function(question)
+        outcomes = await asyncio.gather(
+            *(forecast_fn(question, news) for _ in range(self.predictions_per_research_report)),
+            return_exceptions=True,
+        )
+        preds = [o.prediction_value for o in outcomes if not isinstance(o, BaseException)]
+        result["errors"] += [f"{type(o).__name__}: {str(o)[:500]}" for o in outcomes if isinstance(o, BaseException)]
+        result["individual"] = [_prediction_to_json(p) for p in preds]
+        # Same rule as the normal arm: at least half of the predictions must succeed.
+        needed = self.predictions_per_research_report * self.required_successful_predictions
+        if not preds or len(preds) < needed:
+            raise RuntimeError(f"only {len(preds)} of {self.predictions_per_research_report} shadow predictions succeeded")
+        aggregated = await self._aggregate_predictions(preds, question)
+        result["final"] = _final_to_json(aggregated)
+
+    def _shadow_forecast_function(self, question):
+        # Same order as forecasting_tools' _make_prediction. Conditional questions are not supported.
+        if isinstance(question, BinaryQuestion):
+            return self._run_forecast_on_binary
+        if isinstance(question, MultipleChoiceQuestion):
+            return self._run_forecast_on_multiple_choice
+        if isinstance(question, NumericQuestion):
+            return self._run_forecast_on_numeric
+        if isinstance(question, DateQuestion):
+            return self._run_forecast_on_date
+        raise ValueError(f"shadow arm does not support {type(question).__name__}")
+
+    async def _shadow_write_query(self, question) -> str:
+        prompt = clean_indents(
+            f"""
+            Write ONE short news search query (3 to 10 words) that would find recent news articles
+            most useful for forecasting the question below. Use the key names, places, organisations
+            and topic words. No quotes, no operators, no explanation. Reply with the query only.
+
+            Question: {question.question_text}
+
+            Resolution criteria: {str(question.resolution_criteria)[:1500]}
+
+            The question closes on {self._format_time(question.close_time)}.
+            """
+        )
+        raw = await self.get_llm("default", "llm").invoke(prompt)
+        lines = [ln.strip() for ln in str(raw).strip().splitlines() if ln.strip()]
+        query = (lines[-1] if lines else "").strip().strip('"').strip("'").strip()
+        if query.lower().startswith("query:"):
+            query = query[6:].strip()
+        if not query:
+            query = question.question_text  # fall back to the title
+        return query[:200]
+
+    async def _shadow_search_news(self, query: str, info: dict) -> str | None:
+        """One AskNews 'latest news' search (never the archive search).
+        Only one AskNews call at a time, at least 2.5 s apart."""
+        from asknews_sdk import AsyncAskNewsSDK
+
+        async with self._shadow_asknews_lock:
+            if _SHADOW_RUN["disabled_reason"]:
+                return None
+            if _SHADOW_RUN["credits_used"] + 1 > SHADOW_CREDIT_CAP_PER_RUN:
+                _SHADOW_RUN["disabled_reason"] = f"per-run AskNews cap of {SHADOW_CREDIT_CAP_PER_RUN} credits reached"
+                _shadow_warn_once("cap", f"{_SHADOW_RUN['disabled_reason']}; shadow skipped for the rest of this run.")
+                return None
+            wait = SHADOW_ASKNEWS_GAP_SECONDS - (time.time() - _SHADOW_RUN["last_asknews_call"])
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                async with AsyncAskNewsSDK(
+                    api_key=os.environ["ASKNEWS_API_KEY"], scopes={"news"}, timeout=60, retries=1
+                ) as ask:
+                    resp = await ask.news.search_news(
+                        query=query,
+                        n_articles=SHADOW_ARTICLES,
+                        return_type="both",
+                        strategy="latest news",
+                    )
+            except Exception as e:
+                if _is_credit_exhausted_error(e):
+                    _SHADOW_RUN["disabled_reason"] = f"AskNews refused ({str(e)[:150]}), probably out of credits"
+                    _shadow_warn_once("credits", f"{_SHADOW_RUN['disabled_reason']}; shadow skipped for the rest of this run.")
+                raise
+            finally:
+                _SHADOW_RUN["last_asknews_call"] = time.time()
+            reported = resp.usage.credits if getattr(resp, "usage", None) is not None else None
+            charged = reported if isinstance(reported, int) else 1  # count 1 if not reported
+            _SHADOW_RUN["credits_used"] += charged
+            info["asknews_credits"] = charged
+            info["asknews_credits_reported"] = reported
+        articles = list(resp.as_dicts or [])
+        info["article_count"] = len(articles)
+        dates = [a.pub_date for a in articles if getattr(a, "pub_date", None) is not None]
+        if dates:
+            info["newest_article_utc"] = _iso(max(dates))
+            info["oldest_article_utc"] = _iso(min(dates))
+        if not articles:
+            return "No recent news articles were found for this question."
+        text = "Here are recent news articles (AskNews, latest news):\n\n"
+        for a in sorted(articles, key=lambda x: x.pub_date, reverse=True):
+            text += (
+                f"**{a.eng_title}**\n{a.summary}\n"
+                f"Publish date: {a.pub_date.strftime('%Y-%m-%d %H:%M UTC')}\nSource: {a.source_id}\n\n"
+            )
+        return text
+
+    def _shadow_write_record(self, question, info: dict, result: dict, succeeded: bool) -> None:
+        record = {
+            "arm": "shadow-news",
+            "shadow_tag": SHADOW_TAG,
+            "logged_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "run_time_utc": RUN_STARTED_UTC,
+            "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+            "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "mode": RUN_MODE,
+            "model": MODEL_NAME,
+            "prompt_version": PROMPT_VERSION,
+            "post_id": question.id_of_post,
+            "question_id": question.id_of_question,
+            "question_type": type(question).__name__,
+            "group_option": question.group_question_option,
+            "title": question.question_text,
+            "page_url": question.page_url,
+            "open_time": _iso(question.open_time),
+            "scheduled_close_time": _iso(question.close_time),
+            "scheduled_resolution_time": _iso(getattr(question, "scheduled_resolution_time", None)),
+            "individual_predictions": result["individual"],
+            "n_individual": len(result["individual"]),
+            "final_forecast": result["final"],
+            "publish_enabled": False,  # the shadow is never posted
+            "succeeded": succeeded,
+            "range_check_retries": result["retries"],
+            "errors": result["errors"],
+            "search_query": info.get("search_query"),
+            "article_count": info.get("article_count"),
+            "newest_article_utc": info.get("newest_article_utc"),
+            "oldest_article_utc": info.get("oldest_article_utc"),
+            "asknews_credits": info.get("asknews_credits", 0),
+            "asknews_credits_reported": info.get("asknews_credits_reported"),
+            "asknews_credits_run_total": _SHADOW_RUN["credits_used"],
+            "shadow_llm_cost_usd": result["cost"],
+        }
+        _write_forecast_log_line(record)
 
     ##################################### RESEARCH #####################################
 
