@@ -51,17 +51,30 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# MODEL SETTINGS (Sidecar-bot) -- change the model here, in this one place.
-# MODEL_NAME is used for ALL roles: default (forecasting), summarizer,
-# researcher and parser. Research is a plain LLM call with NO web search.
-# To add web research later, change RESEARCHER below (for example to
-# "asknews/news-summaries", which also needs ASKNEWS_* secrets).
+# MODEL SETTINGS (Sidecar-bot) -- change the models here, in this one place.
+# POSTED_MODEL: the forecast that is POSTED to Metaculus (Build 12: Gemini 3.7
+#   Flash). Used for ALL roles of the posted arm: default (forecasting),
+#   summarizer, researcher and parser.
+# LAB_MODEL: the lab arms (lab-plain, shadow-news, shadow-sceptic). They are
+#   never posted; they only go into the encrypted forecast log.
+# Research in the posted and lab-plain arms is a plain LLM call, NO web search.
+# Backup posted model if Gemini 3.7 Flash has problems:
+#   "openrouter/google/gemini-3.8-flash" (about +30% cost, tested 13 Nov).
 # =============================================================================
-MODEL_NAME = "openrouter/openai/gpt-oss-120b"
+POSTED_MODEL = "openrouter/google/gemini-3.7-flash"
+LAB_MODEL = "openrouter/openai/gpt-oss-120b"
+MODEL_NAME = POSTED_MODEL  # old name, kept so older test scripts still work
+POSTED_ALLOWED_TRIES = 4  # Build 12: was 2. Each try also has its own 429 backoff (see OPENROUTER CALLS).
+LAB_ALLOWED_TRIES = 2
 
 
-def build_llms() -> dict:
-    llm = GeneralLlm(model=MODEL_NAME, temperature=0.3, timeout=120, allowed_tries=2)
+def build_llms(model: str | None = None, allowed_tries: int | None = None) -> dict:
+    llm = GeneralLlm(
+        model=model or POSTED_MODEL,
+        temperature=0.3,
+        timeout=120,
+        allowed_tries=allowed_tries or POSTED_ALLOWED_TRIES,
+    )
     RESEARCHER = llm  # plain LLM, no web search
     return {
         "default": llm,
@@ -69,6 +82,10 @@ def build_llms() -> dict:
         "researcher": RESEARCHER,
         "parser": llm,
     }
+
+
+def build_lab_llms() -> dict:
+    return build_llms(LAB_MODEL, LAB_ALLOWED_TRIES)
 # =============================================================================
 
 # =============================================================================
@@ -78,7 +95,7 @@ def build_llms() -> dict:
 # The GitHub workflows encrypt this file and upload only the encrypted copy.
 # Logging must never break a run: every step is wrapped in try/except.
 # =============================================================================
-PROMPT_VERSION = "v1-build6"
+PROMPT_VERSION = "v2-gemini37flash"  # prompts unchanged since v1-build6; the posted model changed
 FORECAST_LOG_PATH = os.environ.get("FORECAST_LOG_PATH", "forecast_log.jsonl")
 RUN_STARTED_UTC = datetime.now(timezone.utc).isoformat(timespec="seconds")
 RUN_MODE = "unknown"  # set in __main__
@@ -126,6 +143,205 @@ def _write_forecast_log_line(record: dict) -> None:
 # =============================================================================
 
 # =============================================================================
+# OPENROUTER CALLS (Sidecar-bot, Build 12). Every LLM call of every arm goes
+# through _sidecar_acompletion (it wraps forecasting_tools' litellm call).
+# 1. Real cost: OpenRouter returns usage.cost on each answer; it is added to
+#    the arm's bucket (logged per question) and to the run total.
+# 2. Rate limit: tested 14 Nov, OpenRouter refuses more than 20 requests per
+#    minute PER MODEL for this (new) account with HTTP 429 (seen for Gemini
+#    3.7 Flash; 25 parallel gpt-oss-120b calls were all accepted). Calls to
+#    POSTED_MODEL are throttled to POSTED_MODEL_MAX_CALLS_PER_MINUTE, and any
+#    429 is waited out and retried (RATE_LIMIT_EXTRA_TRIES times, growing
+#    waits) BEFORE the normal allowed_tries retry is used up.
+# 3. Cost guard (lab arms only, posting never stops): if this run's real
+#    spend passes LAB_RUN_SPEND_CAP_USD, or the OpenRouter key's remaining
+#    credit (checked when the lab phase starts, then reduced by this run's
+#    spend) drops below LAB_MIN_KEY_REMAINING_USD, the lab arms are skipped
+#    for the rest of the run.
+# 4. Lab model: inside a lab arm, get_llm() returns LAB_MODEL instead of
+#    POSTED_MODEL (a context variable, so the posted arm never sees it).
+# =============================================================================
+POSTED_MODEL_MAX_CALLS_PER_MINUTE = 18  # OpenRouter limit is 20; keep a margin
+RATE_LIMIT_EXTRA_TRIES = 4
+RATE_LIMIT_BASE_WAIT_S = 15.0  # waits 15, 30, 45, 60 s (+ up to a third of 15 s, random)
+LAB_RUN_SPEND_CAP_USD = 8.0
+LAB_MIN_KEY_REMAINING_USD = 2.0
+
+_ARM: contextvars.ContextVar = contextvars.ContextVar("sidecar_arm", default="posted")
+_CALL_BUCKET: contextvars.ContextVar = contextvars.ContextVar("sidecar_call_bucket", default=None)
+_LAB_LLMS: contextvars.ContextVar = contextvars.ContextVar("sidecar_lab_llms", default=None)
+_RUN_COST = {"total": 0.0, "by_arm": {}}
+_LAB_GUARD = {"reason": None, "key_remaining": None, "total_at_key_check": 0.0, "logged": False}
+
+
+class LabCostGuardStop(RuntimeError):
+    pass
+
+
+def _new_bucket() -> dict:
+    return {"cost": 0.0, "calls": 0, "cost_missing_calls": 0, "rate_limit_429s": 0}
+
+
+def _count(arm: str, field: str, value=1) -> None:
+    for b in (_CALL_BUCKET.get(), _RUN_COST["by_arm"].setdefault(arm, _new_bucket())):
+        if b is not None:
+            b[field] += value
+
+
+def _is_rate_limit_error(error: BaseException) -> bool:
+    if type(error).__name__ == "RateLimitError":
+        return True
+    if getattr(error, "status_code", None) == 429:
+        return True
+    text = str(error).lower()
+    return "429" in text and "rate limit" in text
+
+
+def _model_key(model) -> str:
+    return str(model or "").strip().lower().removeprefix("openrouter/")
+
+
+def _lab_guard_trip(reason: str) -> None:
+    if _LAB_GUARD["reason"] is None:
+        _LAB_GUARD["reason"] = reason
+        logger.warning(f"LAB COST GUARD: {reason}. Lab arms skipped for the rest of this run; posting is not affected.")
+
+
+def _lab_guard_check() -> None:
+    total = _RUN_COST["total"]
+    if total > LAB_RUN_SPEND_CAP_USD:
+        _lab_guard_trip(f"this run's OpenRouter spend ${total:.2f} passed the ${LAB_RUN_SPEND_CAP_USD:.2f} cap")
+    if _LAB_GUARD["key_remaining"] is not None:
+        left = _LAB_GUARD["key_remaining"] - (total - _LAB_GUARD["total_at_key_check"])
+        if left < LAB_MIN_KEY_REMAINING_USD:
+            _lab_guard_trip(f"OpenRouter credit left is about ${left:.2f}, under ${LAB_MIN_KEY_REMAINING_USD:.2f}")
+
+
+def _fetch_openrouter_remaining() -> float | None:
+    """Smallest of: the key's limit_remaining (GET /api/v1/key) and the
+    account's total_credits - total_usage (GET /api/v1/credits). None if both
+    fail. The key itself is never logged."""
+    import requests
+
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        return None
+    values = []
+    headers = {"Authorization": f"Bearer {key}"}
+    try:
+        d = requests.get("https://openrouter.ai/api/v1/key", headers=headers, timeout=20).json()["data"]
+        if d.get("limit_remaining") is not None:
+            values.append(float(d["limit_remaining"]))
+    except Exception:
+        pass
+    try:
+        d = requests.get("https://openrouter.ai/api/v1/credits", headers=headers, timeout=20).json()["data"]
+        values.append(float(d["total_credits"]) - float(d["total_usage"]))
+    except Exception:
+        pass
+    return min(values) if values else None
+
+
+class _RollingLimiter:
+    """At most `n` calls start in any 60 s window (per event loop)."""
+
+    def __init__(self, n: int, window: float = 60.0):
+        self.n, self.window = n, window
+        self.times: list[float] = []
+        self._lock = None
+        self._loop = None
+
+    async def acquire(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:  # new event loop (e.g. a second asyncio.run)
+            self._loop, self._lock = loop, asyncio.Lock()
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                self.times = [t for t in self.times if now - t < self.window]
+                if len(self.times) < self.n:
+                    self.times.append(now)
+                    return
+                await asyncio.sleep(self.times[0] + self.window - now + 0.05)
+
+
+_POSTED_LIMITER = _RollingLimiter(POSTED_MODEL_MAX_CALLS_PER_MINUTE)
+
+
+def _install_openrouter_wrapper() -> None:
+    import random
+
+    import forecasting_tools.ai_models.general_llm as general_llm_module
+
+    if getattr(general_llm_module.acompletion, "_sidecar_wrapper", False):
+        return
+    original = general_llm_module.acompletion
+
+    async def _sidecar_acompletion(*args, **kwargs):
+        arm = _ARM.get()
+        is_lab = arm != "posted"
+        throttled = _model_key(kwargs.get("model")) == _model_key(POSTED_MODEL)
+        rate_limit_tries = 0
+        while True:
+            if is_lab and _LAB_GUARD["reason"]:
+                raise LabCostGuardStop(f"lab arm stopped by cost guard: {_LAB_GUARD['reason']}")
+            if throttled:
+                await _POSTED_LIMITER.acquire()
+            try:
+                response = await original(*args, **kwargs)
+            except Exception as e:
+                if not _is_rate_limit_error(e):
+                    raise
+                _count(arm, "rate_limit_429s")
+                if rate_limit_tries >= RATE_LIMIT_EXTRA_TRIES:
+                    raise
+                rate_limit_tries += 1
+                wait = RATE_LIMIT_BASE_WAIT_S * rate_limit_tries + random.uniform(0, RATE_LIMIT_BASE_WAIT_S / 3)
+                logger.warning(
+                    f"OpenRouter 429 rate limit ({arm} arm, {kwargs.get('model')}); "
+                    f"waiting {wait:.0f} s, then retry {rate_limit_tries} of {RATE_LIMIT_EXTRA_TRIES}."
+                )
+                await asyncio.sleep(wait)
+                continue
+            try:
+                cost = getattr(getattr(response, "usage", None), "cost", None)
+                _count(arm, "calls")
+                if isinstance(cost, (int, float)):
+                    _count(arm, "cost", float(cost))
+                    _RUN_COST["total"] += float(cost)
+                else:
+                    _count(arm, "cost_missing_calls")
+                _lab_guard_check()
+            except Exception:
+                pass  # cost tracking must never break a call
+            return response
+
+    _sidecar_acompletion._sidecar_wrapper = True
+    general_llm_module.acompletion = _sidecar_acompletion
+
+
+_install_openrouter_wrapper()
+
+
+def _bucket_fields(bucket: dict | None) -> dict:
+    b = bucket or _new_bucket()
+    return {
+        "openrouter_cost_usd": round(b["cost"], 6),
+        "openrouter_calls": b["calls"],
+        "openrouter_cost_missing_calls": b["cost_missing_calls"],
+        "rate_limit_429s": b["rate_limit_429s"],
+    }
+
+
+def run_cost_summary() -> str:
+    parts = []
+    for arm, b in _RUN_COST["by_arm"].items():
+        parts.append(f"{arm} ${b['cost']:.4f} ({b['calls']} calls, {b['rate_limit_429s']} x 429)")
+    guard = f" Lab cost guard: {_LAB_GUARD['reason']}." if _LAB_GUARD["reason"] else ""
+    return f"OpenRouter real cost this run: total ${_RUN_COST['total']:.4f}. " + "; ".join(parts) + "." + guard
+# =============================================================================
+
+# =============================================================================
 # SHADOW NEWS ARM (Sidecar-bot, Build 10). LOG ONLY, NEVER POSTED.
 # After ALL normal forecasts of a run have been posted, each question gets a
 # second "with-news" forecast: one LLM call writes a news search query, one
@@ -141,9 +357,22 @@ SHADOW_TAG = "shadow-news-v1"
 SHADOW_CREDIT_CAP_PER_RUN = 80  # counted from the API's usage.credits field
 SHADOW_ASKNEWS_GAP_SECONDS = 2.5  # free plan: 1 request per 2 s
 SHADOW_ARTICLES = 6  # "latest news" search, same size as AskNews test 1
-SHADOW_PARALLEL_QUESTIONS = 2
-SHADOW_PER_QUESTION_TIMEOUT_S = 300
-SHADOW_PHASE_BUDGET_S = 1800  # no new shadow starts after this many seconds
+# Build 12: 2 -> 4. The lab arms run on gpt-oss (25 parallel calls were all
+# accepted, 14 Nov) and the 14 Nov dry run took about 2.3 min per question at
+# 2 at a time, too slow for 60 questions in the budget. AskNews calls stay one
+# at a time, 2.5 s apart (lock below).
+SHADOW_PARALLEL_QUESTIONS = 4
+SHADOW_PER_QUESTION_TIMEOUT_S = 300  # per arm, per question
+# Build 12: 1800 -> 3600. Three lab arms now (lab-plain added). Build 11 took
+# about 21 s per question for news + sceptic; lab-plain adds about 12 s, so
+# about 33 min for 60 questions, which would not fit in 30 min.
+SHADOW_PHASE_BUDGET_S = 3600  # no new lab arm starts after this many seconds
+
+# LAB-PLAIN ARM (Build 12). LOG ONLY, NEVER POSTED. The old posted setup
+# (plain LLM research, no news, same prompts, 5 predictions) on LAB_MODEL, so
+# LAB_MODEL vs POSTED_MODEL can be compared on the same questions.
+# Switch off with env LAB_PLAIN=off. The shadow POST guard covers it.
+LAB_PLAIN_TAG = "lab-plain-v1"
 
 _SHADOW_RUN = {
     "credits_used": 0,
@@ -190,7 +419,7 @@ def _shadow_warn_once(key: str, message: str) -> None:
     if key in _SHADOW_RUN["warned"]:
         return
     _SHADOW_RUN["warned"].add(key)
-    logger.warning(f"Shadow news arm: {message}")
+    logger.warning(f"Lab arms: {message}")
 
 
 def _is_credit_exhausted_error(error: BaseException) -> bool:
@@ -332,7 +561,11 @@ class FallTemplateBot2026(ForecastBot):
     ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
     await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
     ```
-    Additionally OpenRouter has large rate limits immediately on account creation
+    Sidecar-bot: the template said OpenRouter has large rate limits on new
+    accounts. That is WRONG for this account: tested 13-14 Nov, OpenRouter
+    refuses more than 20 requests per minute per model (HTTP 429, "new
+    accounts are limited to 20 requests per minute for this model"). See
+    OPENROUTER CALLS near the top of this file for the throttle and retries.
     """
 
     _max_concurrent_questions = (
@@ -340,6 +573,17 @@ class FallTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+
+    def get_llm(self, purpose: str = "default", guarantee_type=None):
+        """Build 12: inside a lab arm (context variable set), return the
+        LAB_MODEL llm for this purpose; everywhere else the normal (posted) llm."""
+        lab = _LAB_LLMS.get()
+        if lab is None:
+            return super().get_llm(purpose, guarantee_type)
+        if purpose not in lab:
+            raise ValueError(f"lab arm: unknown llm purpose {purpose!r}")
+        llm = lab[purpose]
+        return llm.model if guarantee_type == "string_name" else llm
 
     ##################################### SIDECAR-BOT FORECAST LOG #####################################
 
@@ -369,6 +613,9 @@ class FallTemplateBot2026(ForecastBot):
         report = None
         error: BaseException | None = None
         cost = None
+        bucket = _new_bucket()  # real OpenRouter cost of this question (posted arm)
+        arm_token = _ARM.set("posted")
+        bucket_token = _CALL_BUCKET.set(bucket)
         try:
             with MonetaryCostManager() as cost_manager:
                 try:
@@ -380,7 +627,12 @@ class FallTemplateBot2026(ForecastBot):
             error = e
             raise
         finally:
-            self._fl_write_record(question, report, error, cost)
+            for var, token in ((_CALL_BUCKET, bucket_token), (_ARM, arm_token)):
+                try:
+                    var.reset(token)
+                except Exception:
+                    pass
+            self._fl_write_record(question, report, error, cost, bucket)
             try:  # remember the question for the shadow arm (runs after ALL posting)
                 if not hasattr(self, "_shadow_queue"):
                     self._shadow_queue = []
@@ -388,7 +640,7 @@ class FallTemplateBot2026(ForecastBot):
             except Exception:
                 pass
 
-    def _fl_write_record(self, question, report, error, cost) -> None:
+    def _fl_write_record(self, question, report, error, cost, bucket=None) -> None:
         try:
             state = self._fl_states.pop(id(question), None) if hasattr(self, "_fl_states") else None
             state = state or {"individual": [], "prediction_errors": [], "range_check_retries": 0}
@@ -404,7 +656,7 @@ class FallTemplateBot2026(ForecastBot):
                 "github_run_id": os.environ.get("GITHUB_RUN_ID"),
                 "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
                 "mode": RUN_MODE,
-                "model": MODEL_NAME,
+                "model": POSTED_MODEL,
                 "prompt_version": PROMPT_VERSION,
                 "post_id": question.id_of_post,
                 "question_id": question.id_of_question,
@@ -415,6 +667,7 @@ class FallTemplateBot2026(ForecastBot):
                 "open_time": _iso(question.open_time),
                 "scheduled_close_time": _iso(question.close_time),
                 "scheduled_resolution_time": _iso(getattr(question, "scheduled_resolution_time", None)),
+                **_bucket_fields(bucket),
                 "individual_predictions": state["individual"],
                 "n_individual": len(state["individual"]),
                 "final_forecast": _final_to_json(report.prediction) if report is not None else None,
@@ -440,11 +693,42 @@ class FallTemplateBot2026(ForecastBot):
             await self._run_shadow_phase(queue)
         except Exception as e:  # never let the shadow change the run
             _shadow_warn_once("phase", f"shadow phase failed ({type(e).__name__}: {str(e)[:200]}). Carrying on.")
+        try:
+            if queue:
+                logger.info(run_cost_summary())
+        except Exception:
+            pass
         return reports
+
+    async def _run_lab_task(self, arm: str, fn, bucket: dict, timeout: float = SHADOW_PER_QUESTION_TIMEOUT_S):
+        """Run one lab arm for one question in its OWN asyncio task, with the
+        lab model and the arm's cost bucket set only inside that task."""
+        if not hasattr(self, "_lab_llms_cache"):
+            self._lab_llms_cache = build_lab_llms()
+        lab_llms = self._lab_llms_cache
+
+        async def inner():
+            _ARM.set(arm)
+            _CALL_BUCKET.set(bucket)
+            _LAB_LLMS.set(lab_llms)
+            return await fn()
+
+        return await asyncio.wait_for(asyncio.create_task(inner()), timeout=timeout)
 
     async def _run_shadow_phase(self, queue: list) -> None:
         if not queue:
             return
+        try:  # Build 12 cost guard: remaining OpenRouter credit, once, at the start of the lab phase
+            remaining = await asyncio.to_thread(_fetch_openrouter_remaining)
+            _LAB_GUARD["key_remaining"] = remaining
+            _LAB_GUARD["total_at_key_check"] = _RUN_COST["total"]
+            if remaining is None:
+                logger.warning("LAB COST GUARD: could not read OpenRouter credit; only the per-run spend cap applies.")
+            else:
+                logger.info(f"LAB COST GUARD: OpenRouter credit left at lab start about ${remaining:.2f}.")
+            _lab_guard_check()
+        except Exception as e:
+            logger.warning(f"LAB COST GUARD: credit check failed ({type(e).__name__}). Only the per-run spend cap applies.")
         if os.environ.get("SHADOW_NEWS", "on").strip().lower() in ("off", "0", "false", "no"):
             _SHADOW_RUN["disabled_reason"] = _SHADOW_RUN["disabled_reason"] or "switched off (SHADOW_NEWS=off)"
         elif not os.environ.get("ASKNEWS_API_KEY"):
@@ -466,20 +750,74 @@ class FallTemplateBot2026(ForecastBot):
             logger.setLevel(old_level)
             _SHADOW_ACTIVE["depth"] -= 1
         logger.info(
-            f"Shadow news + sceptic arms: done for {len(queue)} question(s). AskNews credits used this run: {_SHADOW_RUN['credits_used']}."
+            f"Lab arms (lab-plain, shadow-news, shadow-sceptic): done for {len(queue)} question(s). AskNews credits used this run: {_SHADOW_RUN['credits_used']}."
         )
 
+    async def _lab_plain_one_question_safely(self, question, posted_ok: bool, deadline: float) -> None:
+        """Build 12 lab-plain arm: plain LLM research + 5 predictions on LAB_MODEL. Never posted."""
+        result = {"individual": [], "final": None, "errors": [], "retries": 0, "cost": None}
+        bucket = _new_bucket()
+        skipped = None
+        lq = None
+        try:
+            if os.environ.get("LAB_PLAIN", "on").strip().lower() in ("off", "0", "false", "no"):
+                skipped = "skipped: switched off (LAB_PLAIN=off)"
+            elif not posted_ok:
+                skipped = "skipped: the posted arm failed for this question"
+            elif _LAB_GUARD["reason"]:
+                skipped = f"skipped: lab cost guard ({_LAB_GUARD['reason']})"
+            elif asyncio.get_running_loop().time() > deadline:
+                skipped = "skipped: shadow phase time budget used up"
+                _shadow_warn_once("lab-plain-deadline", "lab-plain: time budget used up; remaining lab-plain forecasts skipped.")
+            else:
+                lq = question.model_copy(deep=True)  # own copy: own retry count, never touches posted state
+
+                async def run():
+                    research = await self.run_research(lq)
+                    await self._shadow_predict(lq, research, result)
+
+                with MonetaryCostManager() as cm:
+                    try:
+                        await self._run_lab_task("lab-plain", run, bucket)
+                    finally:
+                        result["cost"] = cm.current_usage
+        except Exception as e:
+            result["errors"].append(f"{type(e).__name__}: {str(e)[:500]}")
+            _shadow_warn_once(
+                f"lab-plain-err-{id(question)}",
+                f"lab-plain failed for {question.page_url} ({type(e).__name__}: {str(e)[:200]}). Carrying on.",
+            )
+        finally:
+            try:
+                if lq is not None and hasattr(self, "_fl_states"):
+                    st = self._fl_states.pop(id(lq), None)
+                    if st:
+                        result["retries"] = st.get("range_check_retries", 0)
+                if skipped:
+                    result["errors"].append(skipped)
+                self._shadow_write_record(
+                    question, {}, result, succeeded=(not skipped and result["final"] is not None),
+                    arm="lab-plain", tag=LAB_PLAIN_TAG, bucket=bucket,
+                )
+            except Exception as e:
+                _shadow_warn_once("lab-plain-log", f"lab-plain: could not write a log line ({type(e).__name__}: {str(e)[:200]}).")
+
     async def _shadow_one_question_safely(self, question, posted_ok: bool, deadline: float) -> None:
+        # Build 12: lab-plain first (own try/except inside; it never raises).
+        await self._lab_plain_one_question_safely(question, posted_ok, deadline)
         info = {
             "search_query": None, "article_count": None, "newest_article_utc": None,
             "oldest_article_utc": None, "asknews_credits": 0,
         }
         result = {"individual": [], "final": None, "errors": [], "retries": 0, "cost": None, "news": None}
+        bucket = _new_bucket()
         skipped = None
         shadow_q = None
         try:
             if not posted_ok:
                 skipped = "skipped: the posted arm failed for this question"
+            elif _LAB_GUARD["reason"]:
+                skipped = f"skipped: lab cost guard ({_LAB_GUARD['reason']})"
             elif _SHADOW_RUN["disabled_reason"]:
                 skipped = f"skipped: {_SHADOW_RUN['disabled_reason']}"
                 _shadow_warn_once("disabled", f"{_SHADOW_RUN['disabled_reason']}; shadow skipped for the rest of this run.")
@@ -491,9 +829,8 @@ class FallTemplateBot2026(ForecastBot):
                 shadow_q = question.model_copy(deep=True)
                 with MonetaryCostManager() as cm:
                     try:
-                        await asyncio.wait_for(
-                            self._shadow_forecast(shadow_q, info, result),
-                            timeout=SHADOW_PER_QUESTION_TIMEOUT_S,
+                        await self._run_lab_task(
+                            "shadow-news", lambda: self._shadow_forecast(shadow_q, info, result), bucket
                         )
                     finally:
                         result["cost"] = cm.current_usage
@@ -511,7 +848,9 @@ class FallTemplateBot2026(ForecastBot):
                         result["retries"] = st.get("range_check_retries", 0)
                 if skipped:
                     result["errors"].append(skipped)
-                self._shadow_write_record(question, info, result, succeeded=(not skipped and result["final"] is not None))
+                self._shadow_write_record(
+                    question, info, result, succeeded=(not skipped and result["final"] is not None), bucket=bucket
+                )
             except Exception as e:
                 _shadow_warn_once("log", f"could not write a shadow log line ({type(e).__name__}: {str(e)[:200]}).")
         # Build 11: the sceptic arm, same news text, after the news arm's line is written.
@@ -522,11 +861,14 @@ class FallTemplateBot2026(ForecastBot):
         info["asknews_credits"] = 0  # no extra search
         info["asknews_credits_reported"] = None
         result = {"individual": [], "final": None, "errors": [], "retries": 0, "cost": None}
+        bucket = _new_bucket()
         skipped = None
         sq = None
         try:
             if os.environ.get("SHADOW_SCEPTIC", "on").strip().lower() in ("off", "0", "false", "no"):
                 skipped = "skipped: switched off (SHADOW_SCEPTIC=off)"
+            elif _LAB_GUARD["reason"]:
+                skipped = f"skipped: lab cost guard ({_LAB_GUARD['reason']})"
             elif news is None:
                 skipped = "skipped: shadow-news has no news text for this question"
             elif asyncio.get_running_loop().time() > deadline:
@@ -544,7 +886,7 @@ class FallTemplateBot2026(ForecastBot):
 
                 with MonetaryCostManager() as cm:
                     try:
-                        await asyncio.wait_for(run(), timeout=SHADOW_PER_QUESTION_TIMEOUT_S)
+                        await self._run_lab_task("shadow-sceptic", run, bucket)
                     finally:
                         result["cost"] = cm.current_usage
         except Exception as e:
@@ -563,7 +905,7 @@ class FallTemplateBot2026(ForecastBot):
                     result["errors"].append(skipped)
                 self._shadow_write_record(
                     question, info, result, succeeded=(not skipped and result["final"] is not None),
-                    arm="shadow-sceptic", tag=SCEPTIC_TAG,
+                    arm="shadow-sceptic", tag=SCEPTIC_TAG, bucket=bucket,
                 )
             except Exception as e:
                 _shadow_warn_once("sceptic-log", f"shadow-sceptic: could not write a log line ({type(e).__name__}: {str(e)[:200]}).")
@@ -689,7 +1031,8 @@ class FallTemplateBot2026(ForecastBot):
         return text
 
     def _shadow_write_record(
-        self, question, info: dict, result: dict, succeeded: bool, arm: str = "shadow-news", tag: str = SHADOW_TAG
+        self, question, info: dict, result: dict, succeeded: bool, arm: str = "shadow-news", tag: str = SHADOW_TAG,
+        bucket: dict | None = None,
     ) -> None:
         record = {
             "arm": arm,
@@ -699,7 +1042,8 @@ class FallTemplateBot2026(ForecastBot):
             "github_run_id": os.environ.get("GITHUB_RUN_ID"),
             "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
             "mode": RUN_MODE,
-            "model": MODEL_NAME,
+            "model": LAB_MODEL,
+            **_bucket_fields(bucket),
             "prompt_version": PROMPT_VERSION,
             "post_id": question.id_of_post,
             "question_id": question.id_of_question,
