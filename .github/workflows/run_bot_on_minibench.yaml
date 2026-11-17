@@ -1,6 +1,6 @@
 name: Forecast on MiniBench
 
-# Sidecar-bot: this is the ONLY workflow with a schedule.
+# Sidecar-bot: scheduled, like run_bot_on_fall.yaml (Build 13). Each forecasts one project only.
 # It forecasts on MiniBench only (not the Fall tournament, not the Metaculus Cup).
 on:
   workflow_dispatch:

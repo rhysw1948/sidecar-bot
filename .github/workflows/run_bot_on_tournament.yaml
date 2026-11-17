@@ -3,6 +3,8 @@ name: Forecast on new AI tournament questions
 on:
   workflow_dispatch:
   # Sidecar-bot: schedule removed (was cron "7,27,47 * * * *"). Run by hand only.
+  # Build 13: forecasts Fall then MiniBench, with the same project filter and
+  # double-post guard. Do NOT run it while the Fall or MiniBench workflow runs.
 
 # Add concurrency group to prevent parallel runs
 concurrency:

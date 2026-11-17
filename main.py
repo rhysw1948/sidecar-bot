@@ -1744,6 +1744,121 @@ class FallTemplateBot2026(ForecastBot):
         )
 
 
+##################################### SIDECAR-BOT ONE FORECAST PER QUESTION (Build 13) #####################################
+# Metaculus rule: "Bot makers should only submit one forecast per question".
+# 1. Each workflow forecasts ONE project only: "fall" = project 33121 (Fall
+#    2026 FutureEval), "minibench" = MiniBench. select_questions_for_mode()
+#    drops any question that belongs to the other project (checked 17 Nov:
+#    MiniBench posts have default_project 33169 "minibench" and an EMPTY
+#    tournament list; Fall posts have default_project 33121 and tournament
+#    "fall-futureeval-2026").
+# 2. The library already skips questions whose my_forecasts history is not
+#    empty. But if that field were ever missing it treats the question as NOT
+#    forecast. confirm_not_forecast() re-reads each remaining question with
+#    GET /api/posts/<id>/ and keeps it ONLY if my_forecasts is present and its
+#    history is empty. Missing field, error or 429 -> skipped (never risk a
+#    second forecast). A 429 stops all further checks in this run.
+FALL_PROJECT_ID = 33121
+FALL_SLUG = "fall-futureeval-2026"
+METACULUS_MIN_GAP_S = 4.5  # >= 4.5 s between Metaculus requests (project rule)
+_LAST_CONFIRM_GET = {"t": 0.0}
+
+
+def _belongs_to_fall(question) -> bool:
+    slugs = [str(s).lower() for s in (getattr(question, "tournament_slugs", None) or [])]
+    return getattr(question, "default_project_id", None) == FALL_PROJECT_ID or FALL_SLUG in slugs
+
+
+def select_questions_for_mode(mode: str, questions: list) -> list:
+    """Keep only the questions of the project this mode is for."""
+    if mode == "fall":
+        kept = [q for q in questions if getattr(q, "default_project_id", None) == FALL_PROJECT_ID]
+    elif mode == "minibench":
+        kept = [q for q in questions if not _belongs_to_fall(q)]
+    else:
+        raise ValueError(f"select_questions_for_mode: unknown mode {mode!r}")
+    dropped = len(questions) - len(kept)
+    if dropped:
+        logger.warning(f"PROJECT FILTER ({mode}): dropped {dropped} question(s) that belong to another project")
+    return kept
+
+
+def _find_question_json(post: dict, question_id) -> dict | None:
+    q = post.get("question")
+    if isinstance(q, dict) and q.get("id") == question_id:
+        return q
+    for sub in ((post.get("group_of_questions") or {}).get("questions") or []):
+        if sub.get("id") == question_id:
+            return sub
+    cond = post.get("conditional") or {}
+    for key in ("question_yes", "question_no"):
+        sub = cond.get(key)
+        if isinstance(sub, dict) and sub.get("id") == question_id:
+            return sub
+    return None
+
+
+def forecast_status_from_post(post: dict, question_id) -> str:
+    """'not_forecast', 'forecast' or 'unknown' (field missing / question not found)."""
+    q = _find_question_json(post, question_id)
+    if q is None or not isinstance(q.get("my_forecasts"), dict):
+        return "unknown"
+    history = q["my_forecasts"].get("history")
+    if history is None:
+        return "unknown"
+    return "forecast" if len(history) > 0 else "not_forecast"
+
+
+def confirm_not_forecast(metaculus_client, questions: list, http_get=None) -> list:
+    """Re-check each question on its own post page. Keep only confirmed
+    'not_forecast' questions. http_get is for offline tests."""
+    import requests
+
+    if http_get is None:
+        def http_get(url):
+            return requests.get(url, timeout=30, **metaculus_client._get_auth_headers())
+
+    kept = []
+    for i, q in enumerate(questions):
+        if getattr(q, "already_forecasted", False):
+            logger.info(f"DOUBLE-POST GUARD: post {q.id_of_post} already forecast (list) - skipped")
+            continue
+        wait = METACULUS_MIN_GAP_S - (time.time() - _LAST_CONFIRM_GET["t"])
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            r = http_get(f"https://www.metaculus.com/api/posts/{q.id_of_post}/")
+            _LAST_CONFIRM_GET["t"] = time.time()
+            if r.status_code == 429:
+                logger.error(
+                    f"DOUBLE-POST GUARD: Metaculus 429 - stopping checks; "
+                    f"{len(questions) - i} question(s) skipped this run"
+                )
+                break
+            if r.status_code != 200:
+                logger.warning(f"DOUBLE-POST GUARD: post {q.id_of_post} HTTP {r.status_code} - skipped")
+                continue
+            status = forecast_status_from_post(r.json(), q.id_of_question)
+        except Exception as e:
+            _LAST_CONFIRM_GET["t"] = time.time()
+            logger.warning(f"DOUBLE-POST GUARD: post {q.id_of_post} check failed ({type(e).__name__}) - skipped")
+            continue
+        if status == "not_forecast":
+            kept.append(q)
+        else:
+            logger.warning(f"DOUBLE-POST GUARD: post {q.id_of_post} status={status} - skipped")
+    logger.info(f"DOUBLE-POST GUARD: {len(kept)} of {len(questions)} question(s) confirmed not yet forecast")
+    return kept
+
+
+def questions_for_single_project_mode(bot, mode: str, http_get=None) -> list:
+    """Open questions of ONE project, filtered and double-checked."""
+    project = FALL_PROJECT_ID if mode == "fall" else MetaculusClient.CURRENT_MINIBENCH_ID
+    questions = bot.metaculus_client.get_all_open_questions_from_tournament(project)
+    questions = select_questions_for_mode(mode, questions)
+    return confirm_not_forecast(bot.metaculus_client, questions, http_get=http_get)
+
+
 def run_outcome_exit_code(forecast_reports: list) -> int:
     """Sidecar-bot: the run fails (exit code 1) only if MORE than half of the
     questions errored. A few skipped questions do not fail the whole run."""
@@ -1776,13 +1891,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["tournament", "minibench", "metaculus_cup", "test_questions"],
+        choices=["tournament", "fall", "minibench", "metaculus_cup", "test_questions"],
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
     args = parser.parse_args()
     run_mode: Literal[
-        "tournament", "minibench", "metaculus_cup", "test_questions"
+        "tournament", "fall", "minibench", "metaculus_cup", "test_questions"
     ] = args.mode
     RUN_MODE = run_mode  # recorded in forecast_log.jsonl
 
@@ -1801,6 +1916,8 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms=build_llms(),
+        # Build 13: >= 4.5 s between Metaculus requests (library default 3.5-4.5 s).
+        metaculus_client=MetaculusClient(sleep_seconds_between_requests=METACULUS_MIN_GAP_S),
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
@@ -1808,6 +1925,7 @@ if __name__ == "__main__":
     # whenever those rotate seasons.
     TOURNAMENT_URLS = {
         "tournament": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
+        "fall": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
         "minibench": "https://www.metaculus.com/tournament/minibench/",
         "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-fall-2026/",
         "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
@@ -1818,23 +1936,22 @@ if __name__ == "__main__":
     # summary printers below.
     client = MetaculusClient()
     if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+        # Manual only. Sidecar-bot Build 13: same as running "fall" then
+        # "minibench", each with the project filter and the double-post guard.
+        # Do not run it while the fall/minibench workflows are running.
+        forecast_reports = []
+        for sub_mode in ("fall", "minibench"):
+            questions = questions_for_single_project_mode(template_bot, sub_mode)
+            forecast_reports += asyncio.run(
+                template_bot.forecast_questions(questions, return_exceptions=True)
             )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
-    elif run_mode == "minibench":
-        # Sidecar-bot: MiniBench only (no Fall tournament, no Metaculus Cup).
+    elif run_mode in ("fall", "minibench"):
+        # Sidecar-bot Build 13: ONE project per workflow, so no question can be
+        # forecast by two workflows. "fall" = project 33121 only (not MiniBench);
+        # "minibench" = MiniBench only (not Fall, not the Metaculus Cup).
+        questions = questions_for_single_project_mode(template_bot, run_mode)
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
+            template_bot.forecast_questions(questions, return_exceptions=True)
         )
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season

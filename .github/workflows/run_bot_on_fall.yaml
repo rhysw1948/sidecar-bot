@@ -1,0 +1,83 @@
+name: Forecast on Fall tournament
+
+# Sidecar-bot Build 13: forecasts on the Fall 2026 FutureEval tournament ONLY
+# (project 33121; not MiniBench, not the Metaculus Cup). MiniBench has its own
+# workflow (run_bot_on_minibench.yaml), so no question is forecast by both.
+# Same model, lab arms, cost guard, encrypted log and private comments as MiniBench.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7,27,47 * * * *" # every 20 min, offset off the hour (same as the template). Already-forecasted questions are skipped.
+
+# Prevent parallel Fall runs. The VPS poke also triggers this workflow
+# (workflow_dispatch) every 20 min; GitHub's own schedule above is a backup.
+# Its own group ("fall"), separate from MiniBench's group.
+concurrency:
+  group: fall
+  cancel-in-progress: false
+
+jobs:
+  forecast_job:
+    runs-on: ubuntu-latest
+    env:
+      # Only these two secrets are needed. Create them under
+      # Settings --> Secrets and variables --> Actions --> New repository secret.
+      METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }} # shadow news arm (log only, never posted)
+    steps:
+      - name: Check secrets are set (fail early)
+        run: |
+          missing=0
+          if [ -z "$METACULUS_TOKEN" ]; then
+            echo "::error::Secret METACULUS_TOKEN is missing. Add it under Settings > Secrets and variables > Actions."
+            missing=1
+          fi
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::error::Secret OPENROUTER_API_KEY is missing. Add it under Settings > Secrets and variables > Actions."
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Both secrets are set."
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.13.1"
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run bot (Fall tournament only)
+        run: |
+          uv run python main.py --mode fall
+      # Sidecar-bot: keep a private record of every raw forecast.
+      # The plain log is encrypted with the public key in this repo, then
+      # deleted. Only the encrypted .gpg file is uploaded (artifacts on a
+      # public repo can be downloaded by any signed-in GitHub user).
+      - name: Encrypt forecast log
+        if: always()
+        run: |
+          gpg --version | head -n 1
+          if [ -f forecast_log.jsonl ]; then
+            echo "forecast_log.jsonl lines: $(wc -l < forecast_log.jsonl)"
+            gpg --batch --yes --trust-model always \
+              --recipient-file forecast_log_pubkey.asc \
+              --output forecast_log.jsonl.gpg --encrypt forecast_log.jsonl
+            rm -f forecast_log.jsonl
+          else
+            echo "No forecast_log.jsonl this run (no questions forecast)."
+          fi
+          ls -la forecast_log* 2>/dev/null || true
+      - name: Upload encrypted forecast log (.gpg only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forecast-log-${{ github.run_id }}
+          path: forecast_log.jsonl.gpg
+          retention-days: 90
+          if-no-files-found: ignore
